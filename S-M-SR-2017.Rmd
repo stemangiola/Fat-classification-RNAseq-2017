@@ -1,0 +1,1932 @@
+---
+title: "Stuchbery-Mangiola-et-al."
+author: "Stuchbery-Mangiola-et-al."
+date: "21/02/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache=TRUE)
+
+```
+
+
+## Import libraries
+
+```{r, results='hide', message=FALSE, warning=FALSE, cache=FALSE}
+#Initialization - libraries
+library(ggplot2)
+library(gridExtra)
+source ("http://www.bioconductor.org/biocLite.R")
+#biocLite("illuminaHumanv4.db")
+library(illuminaHumanv4.db)
+library (beadarray)
+library ( limma )
+library(stringi)
+library(corrgram)
+require(plyr)
+library(reshape)
+library(parallel)
+#Combat
+library(sva)
+#colors
+library(RColorBrewer)
+#SVM
+library(e1071)
+library(pROC)
+library(mda)
+library(caret)
+library(randomForest)
+library(sampling)
+#String elaboration
+library(stringi)
+#install.packages("SPIA_2.18.0.tar.gz", repos = NULL, type = "source")
+library(SPIA)
+#source("http://bioconductor.org/biocLite.R")
+#biocLite()
+#biocLite("topGO")
+library(topGO)
+#biocLite("ALL")
+library(ALL)
+data(ALL)
+#source("http://bioconductor.org/biocLite.R")
+data(geneList)
+#biocLite("hgu95av2.db")
+library(hgu95av2.db)
+
+library(EDASeq)
+library(readr)
+library(Rsubread)
+library(ggplot2)
+library(reshape2)
+library(ggdendro)
+library(viridis) 
+library(grid)
+
+```
+
+```{r}
+setwd("~/PhD/marker-discovery-deconvolution/reproducibility_for_publication-FAT_RNAseq_2_ways")
+```
+
+```{r}
+set.seed(123)
+```
+
+##Read count
+
+```{r}
+#get files keeping the order
+if(0){
+bam.files <- dir("alignment_hg19", pattern=".sam", full.names=T, recursive=T)
+bam.counts <- featureCounts(bam.files,countMultiMappingReads=TRUE,fraction=TRUE, annot.inbuilt="hg19", nthreads=40)
+d <- DGEList(counts=bam.counts$counts, genes=bam.counts$annotation[,c("GeneID","Length")])
+}
+load("counts_paired_end.RData")
+
+d$genes$symbol <- AnnotationDbi:::mapIds(org.Hs.eg.db,
+                         keys=as.character(d$genes$GeneID),
+                         column="SYMBOL",
+                         keytype="ENTREZID",
+                         multiVals="first")
+colnames(d$counts) = sapply(colnames(d$counts), function(cc){
+  strsplit(cc, ".", fixed=T)[[1]][2]
+}) 
+#plot samples hist
+qplot(value, data=melt(d$counts), geom="histogram") + scale_x_log10() + facet_grid(X2 ~ .)
+ggsave("count_distribution_raw_data.pdf")
+
+#labels
+annot <- read.csv("info.csv") 
+annot = annot[match(colnames(d$counts), as.character(annot$Sample)),]
+
+#MDSplot
+png("MDSplots.png")
+plotMDS(log(d$count), col=c("red", "blue", "green")[factor(annot$Label)], labels=annot$Label)
+dev.off()
+
+#take just two ways
+d = d[,as.character(annot$Label)%in%c("Low", "High")]
+annot = annot[as.character(annot$Label)%in%c("Low", "High"),]
+annot$Label = factor(annot$Label)
+annot$Sample = factor(annot$Sample)
+
+png("MDSplots_2_ways.png")
+plotMDS(log(d$count), col=c("red", "blue", "green")[factor(annot$Label)], labels=annot$Label)
+dev.off()
+
+```
+
+
+## Preprocessing
+
+```{r}
+#I keep samples that in any of the groups have at list 2/3 of the samples with more than 2 CPM
+cpm_group1 <- cpm(d)[,which(annot$Label == unique(annot$Label)[1])]
+keep1 <- rowSums(cpm_group1 > 0.5) >= dim(cpm_group1)[2]/3*2  
+#filtering for group 2
+cpm_group2 <- cpm(d)[,which(annot$Label == unique(annot$Label)[2])]
+keep2 <-     rowSums(cpm_group2 > 0.5) >= dim(cpm_group2)[2]/3*2
+#merging all filtering
+isexpr <- keep1 | keep2  
+d.filt <- d[isexpr,]  
+
+ggplot(melt(melt(d.filt$counts)), aes(value, fill=X2)) +   geom_histogram() + facet_grid(X2 ~ .) + scale_x_log10()
+ggsave("count_distribution_filtered_data.pdf")
+
+#merge genes
+temp = data.frame(symbol = d.filt$genes$symbol, d.filt$counts)
+d.filt.nr <- by(temp, temp$symbol, function(df) if(length(df[1,1])>0) matrixStats:::colMedians(as.matrix(df[,-1])) )
+d.filt.nr <- do.call("rbind", d.filt.nr)
+colnames(d.filt.nr) <- colnames(d.filt)
+
+ggplot(melt(melt(d.filt.nr)), aes(value, fill=X2)) +   geom_histogram() + facet_grid(X2 ~ .) + scale_x_log10()
+ggsave("count_distribution_filtered_non_reduntant_data.pdf")
+
+#Eliminate 0s
+d.filt.nr[d.filt.nr<1] = 1;
+
+#MDSplot
+png("MDSplots_after_pre_processing.png")
+plotMDS(log(d.filt.nr), col=c("red", "blue", "green")[factor(annot$Label)], labels=annot$Label)
+dev.off()
+
+cols <- brewer.pal(8,"Set3")
+plotMDS(log(d.filt.nr), col=cols[factor(annot$Batch)], labels=annot$Batch)
+plotMDS(log(d.filt.nr), col=c("red", "blue")[factor(annot$Label)], labels=annot$Label)
+
+myDesign <- model.matrix(~ annot$Label)
+colnames(myDesign) = c("Intercept", "Low")
+
+median_ref = median(d.filt.nr[,1])
+d.filt.nr.norm = apply(d.filt.nr, 2, function(mc){
+  mc / (median(mc)/median_ref)
+})
+#betweenLaneNormalization(set, which="upper")
+
+plotMDS(log(d.filt.nr.norm), col=c("red", "blue")[factor(annot$Label)], labels=annot$Sample)
+
+#plotPCA((d.filt.nr.norm), col=c("red", "blue", "green", "purple", "orange", "black", "grey", "brown")[factor(annot$Batch)])
+#plotPCA((d.filt.nr.norm), col=c("red", "blue")[factor(annot$Label)])
+
+#eliminate outliers
+d.filt.nr.norm.no = d.filt.nr.norm[,!(colnames(d.filt.nr.norm)%in%c("10863PP", "10973PP"))]
+annot = annot[!(as.character(annot$Sample)%in%c("10863PP", "10973PP")),]
+annot$Label = factor(annot$Label)
+annot$Sample = factor(annot$Sample)
+
+plotMDS(log(d.filt.nr.norm.no), col=c("red", "blue")[factor(annot$Label)], labels=annot$Sample)
+```
+
+## Pre-analysis
+
+```{r}
+#Get negative controls
+design <- model.matrix(~ annot$Label)
+y <- DGEList(counts=round(d.filt.nr.norm.no), group=design[,2])
+y <- calcNormFactors(y, method="upperquartile")
+y <- estimateGLMCommonDisp(y, design)
+y <- estimateGLMTagwiseDisp(y, design)
+fit <- glmFit(y, design)
+lrt <- glmLRT(fit, coef=2)
+top <- topTags(lrt, n=nrow(d.filt.nr.norm.no))$table
+
+write.csv(top, file="fat_nat_NO_ruv.csv")
+```
+
+##plot Pc contribution
+```{r}
+ir.pca <- prcomp(t(log(d.filt.nr.norm.no)),   center = TRUE,     scale. = TRUE) 
+pdf("pca_information.pdf")
+plot(ir.pca, type = "l")
+dev.off()
+
+```
+
+
+##RUV4
+
+```{r eval=FALSE}
+source("RUV4.R")
+positive_controls = c("IL6", "TNF", "LEP", "NFKB1", "CD68")
+max_i = 15
+
+#Get negative controls
+design <- model.matrix(~ annot$Label)
+y <- DGEList(counts=round(d.filt.nr.norm.no), group=design[,2])
+y <- calcNormFactors(y, method="upperquartile")
+y <- estimateGLMCommonDisp(y, design)
+y <- estimateGLMTagwiseDisp(y, design)
+fit <- glmFit(y, design)
+lrt <- glmLRT(fit, coef=2)
+top <- topTags(lrt, n=nrow(d.filt.nr.norm.no))$table
+rank <- data.frame(match(rownames(d.filt.nr.norm.no), rownames(top)))
+empirical <- rownames(d.filt.nr.norm.no)[which(!(rownames(d.filt.nr.norm.no) %in% rownames(top)[1:10000]))]
+pc <- which(rownames(top)%in%positive_controls)
+
+#Run RUV
+#dev.off()
+#pdf("RUV_pvalue_distribution.pdf")
+#par(mfrow=c(5,5))
+plot(hist(top$PValue))
+for(i in 1:max_i){
+  set <- newSeqExpressionSet(round(as.matrix(d.filt.nr.norm.no)), phenoData =  data.frame(annot,row.names=colnames(d.filt.nr.norm.no)))
+  set <- betweenLaneNormalization(set, which="upper")
+  set1 = RUVg4.poi(round(d.filt.nr.norm.no)+1,x1=design[,2],x2=NULL,cIdx=empirical,k=i)
+  fmla <- as.formula(paste(c("~ Label", paste(rep("W_", times=i), 1:i, sep="")), collapse=" + "))
+  colnames(set1[[1]]) = paste(rep("W_", times=i), 1:i, sep="")
+  design <- model.matrix(fmla, data=data.frame(Label = design[,2], set1[[1]]))
+  y <- DGEList(counts=round(as.matrix(d.filt.nr.norm.no)), group=design[,2])
+  y <- calcNormFactors(y, method="upperquartile")
+  y <- estimateGLMCommonDisp(y, design)
+  y <- estimateGLMTagwiseDisp(y, design)
+  fit <- glmFit(y, design)
+  lrt <- glmLRT(fit, coef=2)
+  top <- topTags(lrt, n=nrow(d.filt.nr.norm.no))$table
+  rank <- data.frame(rank, match(rownames(d.filt.nr.norm.no), rownames(top)))
+  pc <- data.frame(pc, which(rownames(top)%in%positive_controls))
+  #plotMDS(log(d.filt.nr.norm.no.ruv$normalizedCounts), col=c("red", "blue")[factor(annot$Label)], labels=annot$Sample)
+  plot(hist(top$PValue))
+
+}
+#dev.off()
+
+par(mfrow=c(1,1))
+#positive controls plot
+colnames(pc) = 1:dim(pc)[2]
+pc$genes = positive_controls
+ggplot(melt(pc), aes(x=variable, y=value, group=genes, color=genes )) + geom_line() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"))  + scale_color_brewer(palette="Dark2") + labs(x = "K components RUV normalization", y = "Rank position")
+ggsave("RUV_control_genes.pdf")
+
+mcol=c("red", "blue", "green", "purple", "orange", "black", "grey", "brown")[factor(c(20, 30, 40, 50, 60, 70,  80, 100))]
+ref_i = 14
+  rank_ = rank[rank[,ref_i]%in%1:10,]
+  diff = do.call("cbind", lapply(1:(dim(rank_)[2]-1), function(i){
+    abs(rank_[,i] - rank_[,i+1]) 
+  }))
+ 
+pdf("RUV_top_rank__convergence.pdf")
+plot(colSums(diff), type="l", ylim=c(0,40000))
+for(i in c(11, 13, 15, 20, 30, 40, 60,  80)){
+  rank_ = rank[rank[,ref_i]%in%1:i,]
+  diff = do.call("cbind", lapply(1:(dim(rank_)[2]-1), function(i){
+    abs(rank_[,i] - rank_[,i+1]) 
+  }))
+  lines(colSums(diff), col=mcol[which(c(20, 30, 40, 50, 60, 70,  80, 100)==i)])
+}
+dev.off()
+```
+
+##Normalize after choosen K
+
+```{r}
+source("RUV4.R")
+  chosen_i = 14
+  empirical <- rownames(d.filt.nr.norm.no)[which(!(rownames(d.filt.nr.norm.no) %in% rownames(top)[1:10000]))]
+
+  set1 = RUVg4.poi(round(d.filt.nr.norm.no)+1,x1=design[,2],x2=NULL,cIdx=empirical,k=chosen_i)
+  fmla <- as.formula(paste(c("~ Label", paste(rep("W_", times=chosen_i), 1:chosen_i, sep="")), collapse=" + "))
+  colnames(set1[[1]]) = paste(rep("W_", times=chosen_i), 1:chosen_i, sep="")
+  design <- model.matrix(fmla, data=data.frame(Label = design[,2], set1[[1]]))
+  
+  y <- DGEList(counts=round(as.matrix(d.filt.nr.norm.no)), group=design[,2])
+  y <- calcNormFactors(y, method="upperquartile")
+  y <- estimateGLMCommonDisp(y, design)
+  y <- estimateGLMTagwiseDisp(y, design)
+  fit <- glmFit(y, design)
+  lrt <- glmLRT(fit, coef=2)
+  top <- topTags(lrt, n=nrow(d.filt.nr.norm.no))$table
+  write.csv(top, "DE_table.csv")
+  
+  pdf("plotSmear_de.pdf")
+  deg <- rownames(top)[top$FDR < 0.05]
+  plotSmear(y, de.tags=deg, pch=19)
+  abline(h = c(-1, 1), col = "dodgerblue")
+  fat_2_ways_PCR_expression <- read_csv("fat_2_ways_PCR_expression.csv")
+	fat_2_ways_PCR_expression = data.frame(fat_2_ways_PCR_expression)
+	gene_selection = fat_2_ways_PCR_expression$Gene
+	gene_selection = gene_selection[!gene_selection%in%c("KLF5", "ACAN", "DES")]
+  text(x=top[gene_selection,]$logCPM, y=top[gene_selection,]$logFC, labels=gene_selection, cex=0.7, pos=1)
+  dev.off()
+
+  d.filt.nr.norm.no.ruv = (t(set1[[2]]))
+    pdf("mds_plot_PRE_ruv.pdf", useDingbats=F)
+  plotMDS(log(d.filt.nr.norm.no), col=c("#377EB8", "#E41A1C")[factor(annot$Label)], pch=19 )
+  dev.off()
+  pdf("mds_plot_POST_ruv.pdf", useDingbats=F)
+  plotMDS(log(d.filt.nr.norm.no.ruv), col=c("#377EB8", "#E41A1C")[factor(annot$Label)], pch=19 )
+  dev.off()
+
+ # pdf("boxplot_de.pdf")
+  for(i in 1:40){
+    boxplot(a~b, data.frame(a=d.filt.nr.norm.no.ruv[rownames(top)[i],], b=(annot$Label)), main=rownames(top)[i])
+  }
+  
+  selected_genes = c("IGHA1", "SAA2","SAA1","MYH11","DES","RERGL","SOCS3","PLA2G2A","KIF25","SLC2A1","KLF5","COL6A6","GPR34")
+
+   for(g in selected_genes){
+  	    boxplot(a~b, data.frame(a=d.filt.nr.norm.no.ruv[g,], b=(annot$Label)), main=g)
+
+   }
+  
+    selected_genes = c("IGHA1","MYH11","RERGL","SOCS3","PLA2G2A","CLDN1","OLFM4")
+
+   for(g in selected_genes){
+  	    boxplot(a~b, data.frame(a=d.filt.nr.norm.no.ruv[g,], b=(annot$Label)), main=g)
+
+  }
+#dev.off()
+```
+
+## Heatmap
+
+```{r}
+ex_4_heat = log(d.filt.nr.norm.no.ruv[deg,]+1)
+ex_4_heat = t(apply(ex_4_heat, 1, scale))
+colnames(ex_4_heat) = paste(gsub("PP", "", colnames(d.filt.nr.norm.no.ruv)), annot$Label[match(colnames(d.filt.nr.norm.no.ruv), annot$Sample)], sep=" - ")
+x <- ex_4_heat
+dd.col <- as.dendrogram(hclust(dist(x)))
+col.ord <- order.dendrogram(dd.col)
+
+dd.row <- as.dendrogram(hclust(dist(t(x))))
+row.ord <- order.dendrogram(dd.row)
+
+xx <- scale(x)[col.ord, row.ord]
+xx_names <- attr(xx, "dimnames")
+df <- as.data.frame(xx)
+colnames(df) <- xx_names[[2]]
+df$Genes <- xx_names[[1]]
+df$Genes <- with(df, factor(Genes, levels=Genes, ordered=TRUE))
+
+mdf <- melt(df, id.vars="Genes")
+
+
+ddata_x <- dendro_data(dd.row)
+ddata_y <- dendro_data(dd.col)
+
+### Set up a blank theme
+theme_none <- theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_blank(),
+  axis.title.x = element_text(colour=NA),
+  axis.title.y = element_blank(),
+  axis.text.x = element_blank(),
+  axis.text.y = element_blank(),
+  axis.line = element_blank()
+  #axis.ticks.length = element_blank()
+)
+
+### Create plot components ###    
+# Heatmap
+p1 <- ggplot(mdf, aes(x=variable, y=Genes)) + 
+  geom_tile(aes(fill=value)) + scale_fill_viridis() +
+
+	theme(axis.text.x = element_text(angle = 50, hjust = 1), axis.text.y = element_text(size=1), axis.ticks.y=element_blank() )
+
+# Dendrogram 1
+p2 <- ggplot(segment(ddata_x)) + 
+  geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) + 
+  theme_none + theme(axis.title.x=element_blank())
+
+# Dendrogram 2
+p3 <- ggplot(segment(ddata_y)) + 
+  geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) + 
+  coord_flip() + theme_none
+
+
+### Draw graphic ###
+
+pdf("heatmap_DE_post_RUV.pdf")
+grid.newpage()
+print(p1, vp=viewport(0.8, 0.8, x=0.4, y=0.4))
+print(p2, vp=viewport(0.52, 0.2, x=0.45, y=0.9))
+print(p3, vp=viewport(0.2, 0.8, x=0.9, y=0.4))
+dev.off()
+
+```
+
+## Pathway analysis
+
+```{r eval=TRUE}
+
+  s_2_e <- as.list(org.Hs.egALIAS2EG)
+  s_2_e <- s_2_e[!is.na(s_2_e)]
+  s_2_e = do.call("c", lapply(s_2_e, function(s) s[1]))
+  s_2_e = data.frame(s_2_e)
+  
+  top_4_spia = top
+  top_4_spia$entrez = s_2_e[match(rownames(top_4_spia), rownames(s_2_e)), "s_2_e"]  
+  top_4_spia = top_4_spia[!duplicated(top_4_spia$entrez),]
+  all4spia <- top_4_spia$entrez
+  de4spia <- top_4_spia[top_4_spia$FDR < 0.05,"logFC"]
+  names(de4spia) <- top_4_spia[top_4_spia$FDR < 0.05,"entrez"]
+  
+  
+#Update once Spia dataset
+makeSPIAdata(kgml.path = "../hsa",organism="hsa",out.path="./")
+
+dePaths=spia(
+  de=de4spia,
+  all=all4spia,
+  organism="hsa",
+  nB=2000,
+  plots=F,
+  beta=NULL,
+  combine="fisher",
+  verbose=T,
+  data.dir="./"
+)
+
+
+#View(dePaths[dePaths$pGFdr<0.05,])
+
+write.csv(dePaths[dePaths$pGFdr<0.05,], "DE_path_KEGG_SPIA.csv")
+
+
+ my.file="DE_path_KEGG_GSEA.rnk"
+  my.df <- top_4_spia$logFC
+  names(my.df) <- rownames(top_4_spia)
+  my.df <- my.df[order(abs(my.df), decreasing=T)]
+  write.table(my.df, file=my.file, col.names = F, quote = F, sep="\t")
+  system(sprintf("java -cp gsea2-2.2.2.jar -Xmx8g xtools.gsea.GseaPreranked -gmx %s -rnk %s -collapse false -mode Max_probe -norm meandiv -nperm 5000 -scoring_scheme weighted -rpt_label %s -include_only_symbols true -make_sets true -plot_top_x 100 -rnd_seed timestamp -set_max 500 -set_min 1 -zip_report false -out gsea -gui false", "c2.cp.kegg.v5.1.symbols.gmt", my.file, "KEGG"))
+  
+```
+
+## Marker discovery for periprostatic
+
+**Functions**
+
+## Marker discovery 
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+subsampleGroups <- function(data, myInfo, proportion){
+  colsHigh <- colnames(data)[myInfo$Label=="High"]
+  colsLow <- colnames(data)[myInfo$Label=="Low"]
+  colsValidation <- 
+    c(
+      sample(colsHigh, ceiling(length(colsHigh)*proportion)),
+      sample(colsLow, ceiling(length(colsLow)*proportion))
+    )
+  whichValidation <- colnames(data)%in%colsValidation
+  
+  train <- data[,whichValidation]
+  train.info <- myInfo[whichValidation,]
+  test <- data[,!whichValidation]
+  test.info <- myInfo[!whichValidation,]
+  
+  return(
+    list(
+      train=train, 
+      train.info=train.info, 
+      test=test, 
+      test.info=test.info
+    )
+  )
+}
+featSelec <- function(dummy, g, designMatrix, aw){
+  #print(dummy)
+  predictionSet <- 
+    subsampleGroups(g$train, g$train.info, trainProp)
+  #-----------------------------------------
+  rankOnDE <- function(){
+    #Fit model
+    #myAw <- aw[match(colnames(predictionSet$train), colnames(g$train))]
+    #myDeDesignMatrix <- 
+    #  designMatrix[
+    #    match(colnames(predictionSet$train), colnames(g$train)),
+    #    ]
+    #fit <- lmFit (predictionSet$train , myDeDesignMatrix , weights = myAw)
+    #contrasts <- makeContrasts ( high - low , levels = myDeDesignMatrix )
+    #contr.fit <- eBayes ( contrasts.fit( fit , contrasts ))
+    #return(contr.fit$F.p.value)
+
+    myDeDesignMatrix <-  model.matrix(~ factor(subset(ba.info.pp, Sample%in%colnames(predictionSet$train))$Label))
+    y <- DGEList(counts=predictionSet$train, group=myDeDesignMatrix[,2])
+    y <- calcNormFactors(y, method="upperquartile")
+    y <- estimateGLMCommonDisp(y, myDeDesignMatrix)
+    y <- estimateGLMTagwiseDisp(y, myDeDesignMatrix)
+    fit <- glmFit(y, myDeDesignMatrix)
+    lrt <- glmLRT(fit, coef=2)
+    top <- topTags(lrt, n=nrow(predictionSet$train))$table
+    top = top[rownames(predictionSet$train),]
+   return(top$FDR)
+  }
+  #-----------------------------------------
+  
+  #plot the relationship mean difference ~ sum of sd
+  #qplot(meanDiff, sdSum)  
+  #create rank based on DE
+  rank <- 
+    data.frame(
+      gene=rownames(
+        predictionSet$train[order(rankOnDE()),]
+      )
+    )
+
+  
+  #associate to each gene its position in rank
+  positionInRank <- 
+    rownames(rank)[
+      match(
+        rownames(predictionSet$train),
+        rank$gene
+      )
+      ]  
+  
+  list(
+    #genes = topGenes,
+    positionInRank = positionInRank
+  )
+} 
+getGenesRank <- function(g, reps){  
+  
+  ###Multiple bootstrap execution####
+  ###################################
+  clusInternal <- makeCluster(20)
+  clusterExport(clusInternal,"subsampleGroups")
+  clusterEvalQ(clusInternal, subsampleGroups)
+  clusterExport(clusInternal, "trainProp")
+  clusterEvalQ(clusInternal, library(limma))
+  clusterEvalQ(clusInternal, library(e1071))
+  clusterEvalQ(clusInternal, library(pROC))
+  clusterEvalQ(clusInternal, library(edgeR))
+    clusterExport(clusInternal,"ba.info.pp")
+
+
+  designMatrix <- 
+    model.matrix(~0 + as.factor(g$train.info$Label))
+  colnames(designMatrix) <- c(levels(as.factor(g$train.info$Label)))
+  #aw <- arrayWeights (g$train , designMatrix) 
+  aw = NULL
+  myPredictors <- 
+    parLapply(clusInternal, 
+    #lapply(
+      1:reps, 
+              featSelec, 
+              g=g,
+              designMatrix=designMatrix,
+              aw=aw
+    )  
+ 
+  stopCluster(clusInternal)
+  
+  allRanks <- 
+    do.call(
+      "cbind", 
+      lapply(
+        myPredictors, 
+        function(result) as.numeric(result$positionInRank)
+      )
+    )
+  
+  myOrder <- order(matrixStats:::rowMedians(allRanks), rowSums(allRanks))
+  allRanksTop <- allRanks[myOrder,]
+  allRanksTopGeneID <- rownames(g$train)[myOrder]
+  
+  
+  return(allRanksTopGeneID)
+}
+allClassifiers <- function(g, myGenes, classifiers2use, myFormula, testOnTrain = F){
+  ctrl <- 
+    caret:::trainControl(
+      method = "LGOCV",
+      summaryFunction = caret:::twoClassSummary,
+      classProbs = TRUE,
+      index = list(sample(1: dim(g$train)[2], dim(g$train)[2]/2)),
+      savePredictions = TRUE
+    )
+  #Defining train and test
+  myDF <- t(g$train[rownames(g$train)%in%myGenes,, drop=F])
+  myDF <-
+    data.frame(        
+      #Age = g$train.info$age,
+      myDF,
+      Class = g$train.info$Label
+    )
+  
+  if(testOnTrain == T) {
+    myTest = myDF
+    myTest.class = myDF$Class
+    print("WARNING - testing on training set")
+  }
+  else {
+    myTest <- t(g$test[rownames(g$test)%in%myGenes,, drop=F])
+    myTest <-
+      data.frame(        
+        #Age = g$test.info$age,
+        myTest
+      )
+    myTest.class = g$test.info$Label
+  }
+  
+  #functions
+  getsvm <- function(){    
+  	
+    myModel <- svm(
+      myFormula,
+      data=myDF,
+      probability=TRUE,
+      scale=TRUE,
+      kernal="radial"      
+    )
+    
+    
+    validationPred <- 
+      predict(
+        myModel,
+        myTest,
+        probability=TRUE
+      )
+    validationPred <- attr(validationPred,"probabilities"
+    )
+    roc_obj <- 
+      roc(
+        as.factor(myTest.class),
+        as.numeric(
+          validationPred[,1]
+        )
+      )
+    #plot(roc_obj)
+    
+    return(list(name="svm", prediction=validationPred, roc=roc_obj))
+  }
+  getrf <- function(){
+    myModel <- randomForest(myFormula,  data=myDF )
+    validationPred <- 
+      predict(
+        myModel,
+        myTest,
+        type="prob"
+      )
+    roc_obj <- 
+      roc(
+        as.factor(myTest.class),
+        validationPred[,1]
+      )
+    
+    #plot(roc_obj)
+    
+    return(list(name="rf", prediction=validationPred, roc=roc_obj))
+  }
+  getglm <- function(){
+    glmFit <- glm(myFormula, data=myDF,family=binomial())    
+    
+    validationPred <- 
+      predict(
+        glmFit,
+        myTest,
+        type = "response"
+      )
+    validationPred <- data.frame(low=validationPred, high=1-validationPred)
+    
+    roc_obj <- 
+      roc(
+        as.factor(myTest.class),
+        validationPred[,1]
+      )
+    
+    return(list(name="glm", prediction=validationPred, roc=roc_obj))
+    
+  }
+  
+  returnList <- list()
+  
+  if("svm"%in%classifiers2use) returnList$svm <- getsvm()
+  if("rf"%in%classifiers2use) returnList$rf <- getrf()
+  if("glm"%in%classifiers2use) returnList$glm <- getglm()
+  
+  
+  return(returnList)
+}
+getPerformances <- function(size, g, genes, classifiers2use, myFormula){  
+  genes <- genes[1:size]
+  myPerf <- list()
+  myPerf$size <- size    
+  myPerf$genes <-genes
+  
+  myPerf$auc <- list()
+  myClassifiers <- allClassifiers(g, myPerf$genes, classifiers2use, myFormula)
+  
+  myPerf$roc <- lapply(myClassifiers, function(x) x$roc)
+  myPerf$auc <- lapply(myClassifiers, function(x) x$roc$auc)
+  
+  myPerf
+}
+auc4size <- function(geoffPredictors){
+  return(
+    data.frame(
+      number.of.features=
+        unlist(lapply(
+          geoffPredictors, 
+          function(predictor) predictor$size
+        )),
+      do.call("rbind", (lapply(
+        geoffPredictors, 
+        function(predictor) data.frame(predictor$auc)
+      )))
+    )
+  )
+}
+mainFx <- function(my_g, range_perf_test, classifiers2use, isRandom = F){
+
+  myRank <- getGenesRank(my_g, 100)
+  
+  if(isRandom) myRank <- sample(myRank)
+  
+  clus <- makeCluster(20)  
+  clusterEvalQ(clus, library(limma))
+  clusterEvalQ(clus, library(e1071))
+  clusterEvalQ(clus, library(pROC))
+  clusterEvalQ(clus, library(randomForest))
+
+  
+  clusterExport(clus,"allClassifiers")
+  clusterEvalQ(clus, allClassifiers)
+  clusterExport(clus,"getGenesRank")
+  clusterEvalQ(clus, getGenesRank)  
+  clusterExport(clus,"getPerformances")
+  clusterEvalQ(clus, getPerformances)
+  #calculate performances on transcription plus age
+  classJustDE_nested<-
+    #parLapply(clus,
+    lapply(
+      range_perf_test, 
+      getPerformances,
+      g = my_g,
+      genes = myRank,
+      classifiers2use = classifiers2use,
+      myFormula = Class ~ .
+    )
+  
+  stopCluster(clus)
+  dfPerformances <- data.frame(auc4size(classJustDE_nested))
+  
+  rocs <- lapply(classJustDE_nested, function(x) x$roc)
+  
+  return(list(my_g=my_g, ranks=myRank,  performances=dfPerformances, rocs=rocs))    
+}
+
+```
+
+## Marker discovery pre RUV
+
+```{r eval=TRUE, results='hide', message=FALSE, warning=FALSE}
+iters <- 30
+#Select only periprostatic
+ba.pp <- d.filt.nr.norm.no
+ba.info.pp <- annot
+
+trainProp <- 7/10
+
+myMarkersDF.pp <- 
+  lapply(1:iters, function(dummy){     
+    
+    sample.training <- c(
+      as.character(sample(subset(ba.info.pp, Label=="Low")$Sample, size=length(colnames(ba.pp))*trainProp/2)),
+      as.character(sample(subset(ba.info.pp, Label=="High")$Sample, size=length(colnames(ba.pp))*trainProp/2))
+    )
+  
+    trainingSet <- ba.pp[,colnames(ba.pp)%in%sample.training]
+    trainingSet.info <- ba.info.pp[match(colnames(trainingSet), ba.info.pp$Sample),]
+    k = length(which(colSums(table(trainingSet.info$Label, trainingSet.info$Batch))>1))+1
+    set1 = RUVg4.poi(round(trainingSet)+1,x1=model.matrix(~ Label, data=trainingSet.info)[,2],x2=NULL,cIdx=empirical,k=k)
+    trainingSet = (t(set1[[2]]))
+    
+    validationSet <- ba.pp[,!(colnames(ba.pp)%in%sample.training)]
+    validationSet.info <- ba.info.pp[match(colnames(validationSet), ba.info.pp$Sample),]
+    k = length(which(colSums(table(validationSet.info$Label, validationSet.info$Batch))>1))+1
+    set1 = RUVg4.poi(round(validationSet)+1,x1=model.matrix(~ Label, data=validationSet.info)[,2],x2=NULL,cIdx=empirical,k=k)
+    validationSet = (t(set1[[2]]))
+
+    my_g <- 
+      list(
+        train=trainingSet, 
+        train.info=trainingSet.info, 
+        test=validationSet, 
+        test.info=validationSet.info
+      )    
+    cat(".")
+   mainFx(my_g, c(2:10, seq(20, 100, 10), 200, 500, 1000), c("svm", "rf", "glm"), F)      
+  })
+
+performancesTable <- 
+  data.frame(
+    lapply(lapply(myMarkersDF.pp, function(x) x$performances), melt, id=c("number.of.features"))[[1]][,1:2],
+    value = rowMeans(do.call("cbind", lapply(lapply(lapply(myMarkersDF.pp, function(x) x$performances), melt, id=c("number.of.features")), function(x) x[,3])))
+  )
+
+#plot roc curves
+lengthArrays <- min(unlist(lapply(myMarkersDF.pp, function(x) length(x$rocs[[10]]$svm$sensitivities))))
+
+sens = do.call("cbind", lapply(myMarkersDF.pp, function(x) {
+  s <- unlist(x$rocs[[9]]$svm$sensitivities)
+  if(length(s)>lengthArrays) s <- s[-iters] 
+  s
+}))
+spec = do.call("cbind", lapply(myMarkersDF.pp, function(x) {
+  s <- unlist(x$rocs[[9]]$svm$specificities)
+  if(length(s)>lengthArrays) s <- s[-iters] 
+  s
+}))
+plot_auc_df <- 
+  data.frame(
+    sens.mean = rowMeans(sens), 
+    sens.se=rowSds(sens)/sqrt(dim(sens)[1])*2,
+    spec.mean = rowMeans(spec), 
+    spec.se=rowSds(spec)/sqrt(dim(spec)[1])*2
+  )
+
+ggplot(
+  data=plot_auc_df, 
+  aes(x=spec.mean, y=sens.mean)
+) + 
+  geom_line() +
+  geom_ribbon(aes(ymin=sens.mean-sens.se, ymax=sens.mean+sens.se),alpha=0.5) +
+  scale_x_reverse() +
+  theme_bw() +
+  theme( panel.grid.minor.x = element_blank() ,panel.grid.minor.y = element_blank()) +
+  guides(colour=FALSE) 
+
+ggsave("AUC_pp_no_ruv.pdf")
+
+#plot performances over feature number
+ggplot(
+  data=performancesTable, 
+  aes(
+    x=number.of.features,
+    y=value, 
+    group=interaction(variable), 
+    colour=as.factor(variable)
+  )
+) + 
+  coord_trans(x="log2") + 
+  ylim(0.5, 1) +
+  scale_x_continuous(breaks=c(2:10, seq(20, 100, 10),200, 500, 750, 1000)) +
+  scale_colour_brewer(palette = "Set1") +
+  theme_bw() +
+  theme( 
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_blank()
+  ) +
+  geom_line() +
+  ylab("AUC") 
+
+ggsave("perfarmances_size_pp_no_ruv.pdf")
+
+featureTable <-    
+  Reduce(
+    function(...) merge(..., by="gene", all=T), 
+    lapply(
+      myMarkersDF.pp, 
+      function(x) data.frame(position=1:length(x$ranks), gene = as.character(x$ranks))
+    )
+  )
+featureTable <- featureTable[order(rowMeans(featureTable[,-1])),]
+
+write.csv(featureTable, file="fat_nat_signature_no_ruv.csv")
+```
+
+## Marker discovery post RUV
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+iters <- 30
+#Select only periprostatic
+ba.pp <- d.filt.nr.norm.no.ruv
+ba.info.pp <- annot
+
+trainProp <- 8/10
+
+myMarkersDF.pp <- 
+  lapply(1:iters, function(dummy){     
+    
+    sample.training <- c(
+      as.character(sample(subset(ba.info.pp, Label=="Low")$Sample, size=length(colnames(ba.pp))*trainProp/2)),
+      as.character(sample(subset(ba.info.pp, Label=="High")$Sample, size=length(colnames(ba.pp))*trainProp/2))
+    )
+  
+    trainingSet <- ba.pp[,colnames(ba.pp)%in%sample.training]
+    trainingSet.info <- ba.info.pp[match(colnames(trainingSet), ba.info.pp$Sample),]
+    k = length(which(colSums(table(trainingSet.info$Label, trainingSet.info$Batch))>1))+1
+    set1 = RUVg4.poi(round(trainingSet)+1,x1=model.matrix(~ Label, data=trainingSet.info)[,2],x2=NULL,cIdx=empirical,k=k)
+    trainingSet = (t(set1[[2]]))
+    
+    validationSet <- ba.pp[,!(colnames(ba.pp)%in%sample.training)]
+    validationSet.info <- ba.info.pp[match(colnames(validationSet), ba.info.pp$Sample),]
+    k = length(which(colSums(table(validationSet.info$Label, validationSet.info$Batch))>1))+1
+    set1 = RUVg4.poi(round(validationSet)+1,x1=model.matrix(~ Label, data=validationSet.info)[,2],x2=NULL,cIdx=empirical,k=k)
+    validationSet = (t(set1[[2]]))
+
+    my_g <- 
+      list(
+        train=trainingSet, 
+        train.info=trainingSet.info, 
+        test=validationSet, 
+        test.info=validationSet.info
+      )   
+    cat(".")
+   mainFx(my_g, c(2:10, seq(20, 100, 10), 200, 500, 1000), c("svm", "rf", "glm"), F)      
+  })
+
+performancesTable <- 
+  data.frame(
+    lapply(lapply(myMarkersDF.pp, function(x) x$performances), melt, id=c("number.of.features"))[[1]][,1:2],
+    value = rowMeans(do.call("cbind", lapply(lapply(lapply(myMarkersDF.pp, function(x) x$performances), melt, id=c("number.of.features")), function(x) x[,3])))
+  )
+
+#plot roc curves
+lengthArrays <- min(unlist(lapply(myMarkersDF.pp, function(x) length(x$rocs[[10]]$svm$sensitivities))))
+
+sens = do.call("cbind", lapply(myMarkersDF.pp, function(x) {
+  s <- unlist(x$rocs[[9]]$svm$sensitivities)
+  if(length(s)>lengthArrays) s <- s[-iters] 
+  s
+}))
+spec = do.call("cbind", lapply(myMarkersDF.pp, function(x) {
+  s <- unlist(x$rocs[[9]]$svm$specificities)
+  if(length(s)>lengthArrays) s <- s[-iters] 
+  s
+}))
+plot_auc_df <- 
+  data.frame(
+    sens.mean = rowMeans(sens), 
+    sens.se=rowSds(sens)/sqrt(dim(sens)[1])*2,
+    spec.mean = rowMeans(spec), 
+    spec.se=rowSds(spec)/sqrt(dim(spec)[1])*2
+  )
+
+ggplot(
+  data=plot_auc_df, 
+  aes(x=spec.mean, y=sens.mean)
+) + 
+  geom_line() +
+  geom_ribbon(aes(ymin=sens.mean-sens.se, ymax=sens.mean+sens.se),alpha=0.5) +
+  scale_x_reverse() +
+  theme_bw() +
+  theme( panel.grid.minor.x = element_blank() ,panel.grid.minor.y = element_blank()) +
+  guides(colour=FALSE) 
+
+ggsave("AUC_pp.pdf")
+
+#plot performances over feature number
+ggplot(
+  data=performancesTable, 
+  aes(
+    x=number.of.features,
+    y=value, 
+    group=interaction(variable), 
+    colour=as.factor(variable)
+  )
+) + 
+  coord_trans(x="log2") + 
+  ylim(0.5, 1) +
+  scale_x_continuous(breaks=c(2:10, seq(20, 100, 10),200, 500, 750, 1000)) +
+	scale_colour_brewer(palette = "Set1") +
+  theme_bw() +
+  theme( 
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust=0.3, hjust=1),
+    text = element_text(size=9)
+  ) +
+  geom_line() +
+  ylab("AUC") 
+
+ggsave("perfarmances_size_pp.pdf")
+
+featureTable <-    
+  Reduce(
+    function(...) merge(..., by="gene", all=T), 
+    lapply(
+      myMarkersDF.pp, 
+      function(x) data.frame(position=1:length(x$ranks), gene = as.character(x$ranks))
+    )
+  )
+featureTable <- featureTable[order(rowMeans(featureTable[,-1])),]
+
+write.csv(featureTable, file="fat_nat_ruv_signature.csv")
+```
+
+## Validation on RNAseq
+
+```{r}
+featureTable$gene[1:20]
+```
+
+```{r}
+genes_4_classification =  c("IGHA1","SAA2","SAA1","MYH11","DES","RERGL","SOCS3","PLA2G2A","KIF25","SLC2A1","KLF5","COL6A6","GPR34")
+
+#genes_4_classification = selected_genes
+ba.pp <- d.filt.nr.norm.no.ruv
+ba.info.pp <- annot
+trainProp <- 5/10
+
+performance_choosen_genes = lapply(1:30, function(dummy){
+  
+sample.training <- c(
+      as.character(sample(subset(ba.info.pp, Label=="Low")$Sample, size=length(colnames(ba.pp))*trainProp/2)),
+      as.character(sample(subset(ba.info.pp, Label=="High")$Sample, size=length(colnames(ba.pp))*trainProp/2))
+    )
+  
+    trainingSet <- ba.pp[,colnames(ba.pp)%in%sample.training]
+    trainingSet.info <- ba.info.pp[match(colnames(trainingSet), ba.info.pp$Sample),]
+    k = length(which(colSums(table(trainingSet.info$Label, trainingSet.info$Batch))>1))+1
+    set1 = RUVg4.poi(round(trainingSet) + 1,x1=model.matrix(~ Label, data=trainingSet.info)[,2],x2=NULL,cIdx=empirical,k=k)
+    trainingSet = (t(set1[[2]]))
+    
+    validationSet <- ba.pp[,!(colnames(ba.pp)%in%sample.training)]
+    validationSet.info <- ba.info.pp[match(colnames(validationSet), ba.info.pp$Sample),]
+    k = length(which(colSums(table(validationSet.info$Label, validationSet.info$Batch))>1))+1
+    set1 = RUVg4.poi(round(validationSet)+1,x1=model.matrix(~ Label, data=validationSet.info)[,2],x2=NULL,cIdx=empirical,k=k)
+    validationSet = (t(set1[[2]]))
+
+    my_g <- 
+      list(
+        train=trainingSet, 
+        train.info=trainingSet.info, 
+        test=validationSet, 
+        test.info=validationSet.info
+      ) 
+
+    
+    
+allClassifiers(my_g, genes_4_classification, "svm", Class ~ .)
+
+#my_auc <- lapply(myClassifiers, function(x) x$roc$auc)
+
+})
+
+
+# plot roc curves
+lengthArrays <- max(unlist(lapply(performance_choosen_genes, function(x) length(x$svm$roc$sensitivities))))
+
+sens = do.call("cbind", lapply(performance_choosen_genes, function(x) {
+  s <- unlist(x$svm$roc$sensitivities)
+  if(length(s)==lengthArrays) s 
+}))
+spec = do.call("cbind", lapply(performance_choosen_genes, function(x) {
+  s <- unlist(x$svm$roc$specificities)
+  if(length(s)==lengthArrays) s 
+}))
+plot_auc_df <- 
+  data.frame(
+    sens.mean = rowMeans(sens), 
+    sens.se=rowSds(sens)/sqrt(dim(sens)[1])*2,
+    spec.mean = rowMeans(spec), 
+    spec.se=rowSds(spec)/sqrt(dim(spec)[1])*2
+  )
+
+all_perf = (unlist(lapply(performance_choosen_genes, function(x) {
+  unlist(x$svm$roc$auc)
+})))
+
+ggplot(
+  data=plot_auc_df, 
+  aes(x=spec.mean, y=sens.mean)
+) + 
+  geom_line() +
+  geom_ribbon(aes(ymin=sens.mean-sens.se, ymax=sens.mean+sens.se),alpha=0.5) +
+  scale_x_reverse() +
+  theme_bw() +
+  theme( panel.grid.minor.x = element_blank() ,panel.grid.minor.y = element_blank()) +
+  guides(colour=FALSE) +
+	 annotate("text", x = 0.5, y = 0.5, label = sprintf("%s +/- %s", round(mean(all_perf), 2), round(mean(all_perf) - quantile(all_perf, 0.05), 2))
+)
+
+ggsave("AUC_pp_selected_genes.pdf")
+
+
+```
+
+## PCR data
+
+```{r}
+
+fat_2_ways_PCR_expression <- read_csv("fat_2_ways_PCR_expression.csv")
+fat_2_ways_PCR_expression = data.frame(fat_2_ways_PCR_expression)
+rownames(fat_2_ways_PCR_expression) = fat_2_ways_PCR_expression$Gene
+fat_2_ways_PCR_expression = fat_2_ways_PCR_expression[,-1]
+fat_2_ways_PCR_expression = as.matrix(fat_2_ways_PCR_expression)
+
+genes_4_classification = rownames(fat_2_ways_PCR_expression)
+X2_ways_sample_grade <- read_csv("2_ways_sample_grade.csv", col_names = FALSE)
+
+boxplot_df = melt(fat_2_ways_PCR_expression)
+boxplot_df$grade = X2_ways_sample_grade$X3[match(boxplot_df$X2, X2_ways_sample_grade$X1)]
+#boxplot_df = subset(boxplot_df, X1%in%c("IGHA1","RERGL","OLFM4","SLC2A1","COL6A6","CLDN1","PCDH10"))
+boxplot_df = subset(boxplot_df, X1%in%c("IGHA1","MYH11","RERGL","SOCS3","PLA2G2A","CLDN1","OLFM4"))
+ggplot(boxplot_df, aes(x=grade, y=value), width=10, height=10) + geom_boxplot() + geom_jitter(shape=16, position=position_jitter(0.2)) + 
+	facet_wrap(~X1,  scales = "free") + 
+	theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"))  + scale_color_brewer(palette="Dark2") + labs(x = "Cancer grade", y = "CT-values") + scale_y_log10() 
+ggsave("PCR_boxplots.pdf", width=10, height=10, useDingbats=FALSE)
+
+pcr.compare <- log(fat_2_ways_PCR_expression)
+pcr.compare = pcr.compare[!rownames(pcr.compare)%in%c("KLF5", "ACAN", "DES"), ]
+rnaSeq.compare = log(d.filt.nr.norm.no.ruv[rownames(pcr.compare),])
+my_df = data.frame(m1= rowMeans(pcr.compare, na.rm=T), sd1=(rowSds(pcr.compare, na.rm=T)/sqrt(dim(pcr.compare)[2])), m2= rowMeans(rnaSeq.compare, na.rm=T), sd2=(rowSds(rnaSeq.compare, na.rm=T))/sqrt(dim(rnaSeq.compare)[2]))
+cors <- summary(lm(my_df$m1 ~ my_df$m2))
+
+ggplot(my_df, aes(x=m1, y=m2)) +
+  geom_point(shape=1) +    
+  geom_smooth(method=lm)+ 
+  geom_errorbarh(aes(xmin=m1-sd1,
+                   xmax=m1+sd1),
+                 height=0.05)+
+  geom_errorbar(aes(ymin=m2-sd2,
+                    ymax=m2+sd2),
+                width=0.025) +
+	theme_bw() +
+  theme( 
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust=0.3, hjust=1),
+    text = element_text(size=9)
+  ) +
+	geom_text(aes(label="Cor = 0.69; p-value = 0.0009; R2 = 0.6142"), x=-5, y=6)
+
+ggsave("correlation_PCR_rnaSEQ.pdf", useDingbats=FALSE)
+
+# Differential transcription
+pcr.compare.info <- data.frame(Sample = X2_ways_sample_grade$X1, Label=X2_ways_sample_grade$X3, Batch = 1)
+pcr.compare.info$Sample = as.character(pcr.compare.info$Sample)
+my_df = melt(data.frame(t(pcr.compare), label=pcr.compare.info$Label))
+library(plyr)
+de.pcr.stats = ddply(my_df,"variable",
+      function(x) {
+      	if(top[unique(x$variable), "logFC"] < 0) { alternative = "greater" 
+      	} else { alternative = "less" } 
+          w <- t.test(value~label,data=x, alternative=alternative)
+          with(w,data.frame(statistic,p.value)/2)
+      })
+
+de.pcr.stats$p.value.adj = p.adjust(de.pcr.stats$p.value, method = "BH")
+rownames(pcr.compare) = paste(rownames(pcr.compare), round(de.pcr.stats$p.value.adj, 3), sep=" adj. p-value = ")
+my_df = melt(data.frame(t(pcr.compare), label=pcr.compare.info$Label))
+ggplot(my_df, aes(factor(label), (value))) + geom_boxplot()  + facet_wrap(~variable, scales = "free")
+ggsave("t-test_PCR.pdf")
+
+# Fold change comparison
+
+pcr.delta <- fat_2_ways_PCR_expression
+pcr.delta = pcr.delta[!rownames(pcr.delta)%in%c("KLF5", "ACAN", "DES"), ]
+pcr.delta.delta = rowMedians((pcr.delta[,X2_ways_sample_grade$X1[X2_ways_sample_grade$X3=="High"]]), na.rm=T) - rowMedians((pcr.delta[,X2_ways_sample_grade$X1[X2_ways_sample_grade$X3=="Low"]]), na.rm=T)
+names(pcr.delta.delta) = rownames(pcr.delta)
+
+seq.delta = rowMedians(log(d.filt.nr.norm.no.ruv[,annot$Sample[annot$Label=="High"]]), na.rm=T) - rowMedians(log(d.filt.nr.norm.no.ruv[,annot$Sample[annot$Label=="Low"]]), na.rm=T)
+names(seq.delta) = rownames(d.filt.nr.norm.no.ruv)
+seq.delta = seq.delta[names(pcr.delta.delta)]
+
+summary(lm(seq.delta~ pcr.delta.delta))
+
+my_df = data.frame(
+	pcr=pcr.delta.delta, 
+	seq=seq.delta,
+	validated = factor(names(pcr.delta.delta)%in%c("IGHA1","MYH11","RERGL","SOCS3","PLA2G2A","CLDN1","OLFM4")), 
+	significative=-log(top[names(seq.delta),"FDR"]), 
+	gene=names(pcr.delta.delta))
+
+cors <- summary(lm(pcr ~ seq, data=my_df))
+
+summary(lm(seq~ pcr, data = my_df))
+
+ggplot(my_df, aes(x=pcr, y=seq)) + geom_point(aes(color = validated, size=significative)) + 
+	theme_bw() +
+  theme( 
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust=0.3, hjust=1),
+    text = element_text(size=9),
+    aspect.ratio=1
+  ) +
+		geom_abline(intercept = 0.1085, slope = 1.5165) +
+	geom_text(aes(pcr+0.02, seq+0.1, label = gene, size=30)) +
+geom_text(aes(label="Cor = 0.69; p-value = 0.0009; R2 = 0.6142"), x=-5, y=6) +
+ggtitle("Log-Fold-change between High-Low in qRT-PCR and RNAseq") 
+ggsave("Log-Fold-change-between-High-Low-in-qRT-PCR-and-RNAseq.pdf", useDingbats=FALSE)
+
+
+# P-value comparison
+
+pcr.delta <- fat_2_ways_PCR_expression
+pcr.delta = pcr.delta[!rownames(pcr.delta)%in%c("KLF5", "ACAN", "DES"), ]
+pcr.delta.delta = rowMedians((pcr.delta[,X2_ways_sample_grade$X1[X2_ways_sample_grade$X3=="High"]]), na.rm=T) - rowMedians((pcr.delta[,X2_ways_sample_grade$X1[X2_ways_sample_grade$X3=="Low"]]), na.rm=T)
+names(pcr.delta.delta) = rownames(pcr.delta)
+
+seq.delta = rowMedians(log(d.filt.nr.norm.no.ruv[,annot$Sample[annot$Label=="High"]]), na.rm=T) - rowMedians(log(d.filt.nr.norm.no.ruv[,annot$Sample[annot$Label=="Low"]]), na.rm=T)
+names(seq.delta) = rownames(d.filt.nr.norm.no.ruv)
+seq.delta = seq.delta[names(pcr.delta.delta)]
+
+summary(lm(log(top[de.pcr.stats$variable,"FDR"]) ~ log(de.pcr.stats$p.value.adj)))
+
+my_df = data.frame(
+	pcr=log(de.pcr.stats$p.value.adj), 
+	seq=log(top[de.pcr.stats$variable,"FDR"]),
+	validated = factor(de.pcr.stats$variable%in%c("IGHA1","MYH11","RERGL","SOCS3","PLA2G2A","CLDN1","OLFM4")), gene=de.pcr.stats$variable)
+
+
+ggplot(my_df, aes(x=pcr, y=seq)) + geom_point(aes(color = validated)) + 
+	theme_bw() +
+  theme( 
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust=0.3, hjust=1),
+    text = element_text(size=9),
+    aspect.ratio=1
+  ) +
+	geom_text(aes(pcr+0.02, seq+0.1, label = gene, size=10)) +
+geom_text(aes(label="Cor = 0.69; p-value = 0.0009; R2 = 0.6142"), x=-5, y=6) 
+ggtitle("Log-p-value between High-Low in qRT-PCR and RNAsew") 
+
+	
+	
+
+
+
+```
+
+## PCR classification
+
+```{r}
+library(readr)
+fat_2_ways_PCR_expression <- read_csv("fat_2_ways_PCR_expression.csv")
+fat_2_ways_PCR_expression = data.frame(fat_2_ways_PCR_expression)
+rownames(fat_2_ways_PCR_expression) = fat_2_ways_PCR_expression$Gene
+fat_2_ways_PCR_expression = fat_2_ways_PCR_expression[,-1]
+fat_2_ways_PCR_expression = as.matrix(fat_2_ways_PCR_expression)
+colnames(fat_2_ways_PCR_expression) = sapply(colnames(fat_2_ways_PCR_expression), function(ff) strsplit(ff, "_")[[1]][2] )
+genes_4_classification = rownames(fat_2_ways_PCR_expression)
+X2_ways_sample_grade <- read_csv("2_ways_sample_grade.csv", col_names = FALSE)
+X2_ways_sample_grade$X1 = sapply(X2_ways_sample_grade$X1, function(ff) strsplit(ff, "_")[[1]][2] )
+
+plotMDS(log(fat_2_ways_PCR_expression), col= c("red", "blue")[factor(X2_ways_sample_grade$X3)])
+
+
+ba.pp <- fat_2_ways_PCR_expression
+ba.pp = ba.pp[!rownames(ba.pp)%in%c("KLF5", "ACAN", "DES"), ]
+# Fill NA values
+ba.pp = t(apply(ba.pp, 1, function(mr){
+		mr[1:29][is.na(mr[1:29])] = mean(na.omit(mr[1:29]))
+		mr[30:58][is.na(mr[30:58])] = mean(na.omit(mr[30:58]))
+		mr
+}))
+ba.info.pp <- data.frame(Sample = X2_ways_sample_grade$X1, Label=X2_ways_sample_grade$X3, Batch = 1)
+ba.info.pp$Sample = as.character(ba.info.pp$Sample)
+
+rnaSeq_patients = gsub("PP", "", colnames(d.filt.nr.norm.no))
+
+
+performance_choosen_genes = lapply(1:10000, function(dummy){
+		
+		sample.test <- c(
+      as.character(sample(subset(ba.info.pp, Label=="Low" & (!Sample%in%rnaSeq_patients))$Sample, size=4)),
+      as.character(sample(subset(ba.info.pp, Label=="High" & (!Sample%in%rnaSeq_patients))$Sample, size=4))
+    )
+  
+    trainingSet <- ba.pp[,!colnames(ba.pp)%in%sample.test]
+    trainingSet.info <- ba.info.pp[match(colnames(trainingSet), ba.info.pp$Sample),]
+    
+    validationSet <- ba.pp[,(colnames(ba.pp)%in%sample.test)]
+    validationSet.info <- ba.info.pp[match(colnames(validationSet), ba.info.pp$Sample),]
+
+    my_g <- 
+      list(
+        train=trainingSet, 
+        train.info=trainingSet.info, 
+        test=validationSet, 
+        test.info=validationSet.info
+      ) 
+    
+allClassifiers(my_g, genes_4_classification, "svm", Class ~ .)
+
+
+})
+
+
+lengthArrays <- max(unlist(lapply(performance_choosen_genes, function(x) length(x$svm$roc$sensitivities))))
+
+sens = do.call("cbind", lapply(performance_choosen_genes, function(x) {
+  s <- unlist(x$svm$roc$sensitivities)
+  if(length(s)==lengthArrays) s 
+}))
+spec = do.call("cbind", lapply(performance_choosen_genes, function(x) {
+  s <- unlist(x$svm$roc$specificities)
+  if(length(s)==lengthArrays) s 
+}))
+plot_auc_df <- 
+  data.frame(
+    sens.mean = rowMeans(sens), 
+    sens.se=rowSds(sens),
+    spec.mean = rowMeans(spec), 
+    spec.se=rowSds(spec)
+  )
+
+all_perf = (unlist(lapply(performance_choosen_genes, function(x) {
+  unlist(x$svm$roc$auc)
+})))
+
+ggplot(
+  data=plot_auc_df, 
+  aes(x=spec.mean, y=sens.mean)
+) + 
+  geom_line() +
+  geom_ribbon(aes(ymin=sens.mean-sens.se, ymax=sens.mean+sens.se),alpha=0.5) +
+  scale_x_reverse() +
+  theme_bw() +
+  theme( panel.grid.minor.x = element_blank() ,panel.grid.minor.y = element_blank()) +
+  guides(colour=FALSE) +
+	 annotate("text", x = 0.5, y = 0.5, label = sprintf("%s +/- SD %s", round(median(all_perf), 2), round(sd(all_perf), 2) )
+)
+
+ggsave("AUC_pp_selected_genes_PCR_svm.pdf")
+
+```
+
+## Feature selection
+
+```{r}
+# http://machinelearningmastery.com/feature-selection-with-the-caret-r-package/
+# ensure the results are repeatable
+
+# load the library
+library(mlbench)
+library(caret)
+# calculate correlation matrix
+correlationMatrix <- cor(t(ba.pp))
+# summarize the correlation matrix
+print(correlationMatrix)
+# find attributes that are highly corrected (ideally >0.75)
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.5)
+# print indexes of highly correlated attributes
+print(highlyCorrelated)
+# Eliminate highly correlated
+ba.pp.nc = ba.pp[-highlyCorrelated,]
+
+
+control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+model <- train(
+	Class~., 
+	data=data.frame(
+		Class=ba.info.pp$Label[!ba.info.pp$Sample%in%rnaSeq_patients], 
+		t(ba.pp.nc[,!colnames(ba.pp.nc)%in%rnaSeq_patients])
+		), 
+	method="lvq", 
+	preProcess="scale", 
+	trControl=control
+)
+# estimate variable importance
+importance <- varImp(model, scale=FALSE)
+# summarize importance
+print(importance)
+# plot importance
+plot(importance)
+
+
+# define the control using a random forest selection function
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+# run the RFE algorithm
+set.seed(7)
+results <- rfe(t(ba.pp.nc[,!colnames(ba.pp.nc)%in%rnaSeq_patients]), ba.info.pp$Label[!ba.info.pp$Sample%in%rnaSeq_patients], sizes=c(1:14), rfeControl=control)
+# summarize the results
+print(results)
+# list the chosen features
+predictors(results)
+# plot the results
+plot(results, type=c("g", "o"))
+
+my_features = predictors(results)
+
+clus <- makeCluster(10)
+clusterExport(clus,"ba.info.pp")
+clusterExport(clus,"ba.pp")
+clusterExport(clus,"rnaSeq_patients")
+clusterExport(clus,"rfe")
+clusterExport(clus,"control")
+clusterExport(clus,"allClassifiers")
+clusterExport(clus,"genes_4_classification")
+clusterExport(clus,"svm")
+clusterExport(clus,"roc")
+
+set.seed(1984)
+final_performances = parLapply(clus, 1:100, function(dummy){
+	
+	final_test = c(
+      as.character(sample(subset(ba.info.pp, Label=="Low" & (!Sample%in%rnaSeq_patients))$Sample, size=4)),
+      as.character(sample(subset(ba.info.pp, Label=="High" & (!Sample%in%rnaSeq_patients))$Sample, size=4))
+    )
+	
+	final_markers_list = lapply(1:30, function(dummy){
+		
+		sample.test <- c(
+      as.character(sample(subset(ba.info.pp, Label=="Low" & (!Sample%in%rnaSeq_patients)  & (!Sample%in%final_test) )$Sample, size=3)),
+      as.character(sample(subset(ba.info.pp, Label=="High" & (!Sample%in%rnaSeq_patients)  & (!Sample%in%final_test))$Sample, size=3))
+    )
+  
+    trainingSet <- log(ba.pp[,!colnames(ba.pp)%in%sample.test] + 1)
+    trainingSet.info <- ba.info.pp[match(colnames(trainingSet), ba.info.pp$Sample),]
+
+    results <- rfe(t(trainingSet), trainingSet.info$Label, sizes=c(1:14), rfeControl=control)
+# summarize the results
+#print(results)
+# list the chosen features
+predictors(results)
+
+})
+
+final_markers = names(sort(table(unlist(final_markers_list)), decreasing = T))
+
+lapply(2:length(final_markers), function(l){
+ 	
+	trainingSet <- log(ba.pp[final_markers[1:l],!colnames(ba.pp)%in%final_test] + 1)
+	trainingSet.info <- ba.info.pp[match(colnames(trainingSet), ba.info.pp$Sample),]
+	
+	validationSet <- log(ba.pp[final_markers[1:l],(colnames(ba.pp)%in%final_test)] + 1)
+	validationSet.info <- ba.info.pp[match(colnames(validationSet), ba.info.pp$Sample),]
+	
+	my_g <- 
+	  list(
+	    train=trainingSet, 
+	    train.info=trainingSet.info, 
+	    test=validationSet, 
+	    test.info=validationSet.info
+	  ) 
+	
+	ac1 = allClassifiers(my_g, final_markers[1:l], "svm", Class ~ .)
+	ac2 = allClassifiers(my_g, final_markers[1:l], "rf", Class ~ .)
+	ac3 = allClassifiers(my_g, final_markers[1:l], "glm", Class ~ .)
+	
+	list(svm = ac1, rf = ac2, glm = ac3, 
+	summary = rbind(
+		c(final_markers, l, ac1$svm$roc$auc, algorithm="svm"),
+		c(final_markers, l, ac2$rf$roc$auc, algorithm="rf"),
+		c(final_markers, l, ac3$glm$roc$auc, algorithm="glm")
+	))
+
+})
+ 
+})
+
+performancesTable = do.call("rbind", lapply(1:length(final_performances), function(i) 
+	{
+	temp = do.call("rbind", lapply(final_performances[[i]], function(fi) fi$summary))
+	data.frame(run=i, temp[,(dim(temp)[2]-2):dim(temp)[2] ] )
+	
+	}))
+colnames(performancesTable) = c("run", "number.of.features", "value", "variable")
+performancesTable$value = as.numeric(as.character(performancesTable$value))
+performancesTable$number.of.features = as.numeric(as.character(performancesTable$number.of.features))
+df1 = aggregate(performancesTable$value, by=list(number.of.features=performancesTable$number.of.features, variable=performancesTable$variable), mean)
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+}
+df2 = aggregate(performancesTable$value, by=list(number.of.features=performancesTable$number.of.features, variable=performancesTable$variable), st.err)
+
+performancesTable = data.frame(df1, se = df2$x)
+colnames(performancesTable)[3] = "value"
+
+#plot performances over feature number
+ggplot(
+  data=performancesTable, 
+  aes(
+    x=number.of.features,
+    y=value, 
+    group=interaction(variable), 
+    colour=as.factor(variable)
+  )
+) + 
+	scale_colour_brewer(palette = "Set1") +
+  theme_bw() +
+  theme( 
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_blank(),
+    #axis.text.x = element_text(angle = 90, vjust=0.3, hjust=1),
+    text = element_text(size=9)
+  ) +
+  geom_line() +
+	geom_ribbon(aes(ymin=value-se, ymax=value+se),alpha=0.1, colour=NA) +
+	scale_x_continuous( breaks=(1:7)*2) +
+  ylab("AUC") 
+
+ggsave("AUC_pp_size_feature_selection_PCR.pdf")
+
+
+lengthArrays <- max(unlist(lapply(final_performances, function(x) length(x[[2]]$rf$rf$roc$sensitivities))))
+
+sens = do.call("cbind", lapply(final_performances, function(x) {
+  s <- unlist(x[[2]]$rf$rf$roc$sensitivities)
+  if(length(s)==lengthArrays) s 
+}))
+spec = do.call("cbind", lapply(final_performances, function(x) {
+  s <- unlist(x[[2]]$rf$rf$roc$specificities)
+  if(length(s)==lengthArrays) s 
+}))
+plot_auc_df <- 
+  data.frame(
+    sens.mean = rowMeans(sens), 
+    sens.se=rowSds(sens),
+    spec.mean = rowMeans(spec), 
+    spec.se=rowSds(spec)
+  )
+
+all_perf = (unlist(lapply(final_performances, function(x) {
+  unlist(x[[2]]$rf$rf$roc$auc)
+})))
+
+ggplot(
+  data=plot_auc_df, 
+  aes(x=spec.mean, y=sens.mean)
+) + 
+  geom_line() +
+  geom_ribbon(aes(ymin=sens.mean-sens.se, ymax=sens.mean+sens.se),alpha=0.5) +
+  scale_x_reverse() +
+  theme_bw() +
+  theme( panel.grid.minor.x = element_blank() ,panel.grid.minor.y = element_blank()) +
+  guides(colour=FALSE) +
+	 annotate("text", x = 0.4, y = 0.5, label = sprintf("%s +/- SD %s (genes = IGHA1, OLFM4, RERGL)", round(mean(all_perf), 2), round(sd(all_perf), 2) )
+)
+
+ggsave("AUC_pp_feature_selection_PCR_rf.pdf")
+```
+
+```{r}
+
+cli <- read.csv("/wehisan/home/allstaff/m/mangiola.s/PhD/marker-discovery-deconvolution/reproducibility_for_publication-FAT_RNAseq_2_ways/fat_two_ways_clinical.csv")
+cli = cli[match(ba.info.pp$Sample, cli$UBR),]
+rownames(cli) = cli$UBR
+cli = t(cli[,c("preOpPSA" , "Age" ,"BxGGS" ,"cT")])
+
+clus <- makeCluster(10)
+clusterExport(clus,"ba.info.pp")
+clusterExport(clus,"cli")
+clusterExport(clus,"rnaSeq_patients")
+clusterExport(clus,"rfe")
+clusterExport(clus,"control")
+clusterExport(clus,"allClassifiers")
+clusterExport(clus,"genes_4_classification")
+clusterExport(clus,"svm")
+clusterExport(clus,"roc")
+
+set.seed(1984)
+final_performances = parLapply(clus, 1:10, function(dummy){
+	
+	final_test = c(
+      as.character(sample(subset(ba.info.pp, Label=="Low" )$Sample, size=4)),
+      as.character(sample(subset(ba.info.pp, Label=="High" )$Sample, size=4))
+    )
+	
+	final_markers_list = lapply(1:30, function(dummy){
+		
+		sample.test <- c(
+      as.character(sample(subset(ba.info.pp, Label=="Low"   & (!Sample%in%final_test) )$Sample, size=4)),
+      as.character(sample(subset(ba.info.pp, Label=="High"  & (!Sample%in%final_test))$Sample, size=4))
+    )
+  
+    trainingSet <- cli[,!colnames(cli)%in%sample.test]
+    trainingSet.info <- ba.info.pp[match(colnames(trainingSet), ba.info.pp$Sample),]
+
+    results <- rfe(t(trainingSet), trainingSet.info$Label, sizes=c(1:14), rfeControl=control)
+		# summarize the results
+		#print(results)
+		# list the chosen features
+		predictors(results)
+		
+	})
+
+final_markers = names(sort(table(unlist(final_markers_list)), decreasing = T))
+lapply(2:length(final_markers), function(l){
+ 	
+	trainingSet <- cli[final_markers[1:l],!colnames(cli)%in%final_test]
+	trainingSet.info <- ba.info.pp[match(colnames(trainingSet), ba.info.pp$Sample),]
+	
+	validationSet <- cli[final_markers[1:l],(colnames(cli)%in%final_test)]
+	validationSet.info <- ba.info.pp[match(colnames(validationSet), ba.info.pp$Sample),]
+	
+	my_g <- 
+	  list(
+	    train=trainingSet, 
+	    train.info=trainingSet.info, 
+	    test=validationSet, 
+	    test.info=validationSet.info
+	  ) 
+	
+	ac1 = allClassifiers(my_g, final_markers[1:l], "svm", Class ~ .)
+	ac2 = allClassifiers(my_g, final_markers[1:l], "rf", Class ~ .)
+	ac3 = allClassifiers(my_g, final_markers[1:l], "glm", Class ~ .)
+	
+	list(svm = ac1, rf = ac2, glm = ac3, 
+	summary = rbind(
+		c(final_markers, l, ac1$svm$roc$auc, algorithm="svm"),
+		c(final_markers, l, ac2$rf$roc$auc, algorithm="rf"),
+		c(final_markers, l, ac3$glm$roc$auc, algorithm="glm")
+	))
+
+})
+ 
+})
+
+```
+
+## Prediction of tissue composition
+
+```{r}
+
+annot.cibersort <- read.csv("info.csv") 
+annot.cibersort = annot.cibersort[match(colnames(d$counts), as.character(annot.cibersort$Sample)),]
+annot.cibersort = annot.cibersort[match(colnames(d.filt.nr.norm.no.ruv), annot.cibersort$Sample),]
+ref = read.csv("~/PhD/marker-discovery-deconvolution/reproducibility_for_publication-FAT_RNAseq_2_ways/LM22_plus.mean.csv", row.names = 1, header= TRUE, check.names=F)
+ref = as.matrix(ref)
+markers = rownames(ref)
+markers = markers[markers%in%rownames(d.filt.nr.norm.no.ruv)]
+
+write.table(data.frame(gene=markers, ref[markers,]), sep="\t", row.names = F, col.names = T, file=("ref_cibersort.tab"))
+write.table(data.frame(gene=markers, d.filt.nr.norm.no.ruv[markers,]), sep="\t", row.names = F, col.names = T, file=("mix_cibersort.tab"))
+
+source("CIBERSORT_annotated.R")
+results <- CIBERSORT("ref_cibersort.tab", "mix_cibersort.tab")
+
+ggplot(melt(data.frame(results[,-c(26:28)], label = annot.cibersort$Label), id="label"), aes(factor(label), (value), fill = variable)) + geom_boxplot() +facet_wrap(~variable, scales = "free") + theme(legend.position="none")
+ggsave("difference_in_TIL.pdf")
+```
+
+## TCGA comparison
+
+```{r}
+tcga.info <-  read.csv("GDC-TCGA-prostate-info.csv")
+tcga.info = tcga.info[-grep("FPKM", tcga.info$file_name),]
+tcga.info$bcr_patient_barcode = sapply(tcga.info$cases_0_samples_0_portions_0_analytes_0_aliquots_0_submitter_id, function(x) paste(strsplit(as.character(x), "-")[[1]][1:3], collapse="-") )
+tcga.info.clinical <- read.delim("nationwidechildrens.org_clinical_patient_prad.txt", stringsAsFactors=FALSE)
+tcga.info.clinical$file_id = as.character(tcga.info$file_id[match(tcga.info.clinical$bcr_patient_barcode, tcga.info$bcr_patient_barcode)])
+tcga.info.clinical$lab =  sapply(tcga.info.clinical$bcr_patient_barcode, function(x) strsplit(as.character(x), "-")[[1]][2] )
+tcga.ex <- read.csv("tcga_prostate_adenocarcinoma_primary_tumor.csv")
+rownames(tcga.ex) = tcga.ex[,1]
+tcga.ex = tcga.ex[,-1]
+
+tcga.ex = tcga.ex[,-grep(c("f3ac93|X1b13c"), colnames(tcga.ex))]
+
+tcga.info.clinical = tcga.info.clinical[match(gsub("X", "", gsub(".", "-", colnames(tcga.ex), fixed=T)) , tcga.info.clinical$file_id),] 
+
+
+labos=c("CH", "EJ", "G9", "HC", "J4", "V1")
+which_sel = which(
+	tcga.info.clinical$lab %in% labos & 
+	tcga.info.clinical$gleason_pattern_primary %in% c(3,4) &
+	tcga.info.clinical$history_neoadjuvant_treatment == "No"
+	)
+tcga.ex = tcga.ex[,which_sel]
+tcga.info.clinical = tcga.info.clinical[which_sel,]
+table(tcga.info.clinical$gleason_pattern_primary, tcga.info.clinical$lab)
+tcga.ex = as.matrix(tcga.ex)
+
+tcga.ex = tcga.ex[apply(tcga.ex, 1, function(mr) length(which(mr>20)))>100,]
+
+median_ref = median(rowMedians(t(tcga.ex)))
+tcga.ex.norm = apply(tcga.ex, 2, function(mc){
+  mc / (median(mc)/median_ref)
+})
+```
+
+## RUV for TCGA
+
+##Normalize after choosen K
+
+```{r}
+  design <- model.matrix(~tcga.info.clinical$gleason_pattern_primary)
+  y <- DGEList(counts=round(as.matrix(tcga.ex.norm)), group=design[,2])
+  y <- calcNormFactors(y, method="upperquartile")
+  y <- estimateGLMCommonDisp(y, design)
+  y <- estimateGLMTagwiseDisp(y, design)
+  fit <- glmFit(y, design)
+  lrt <- glmLRT(fit, coef=2)
+  top.tcga.pre.ruv <- topTags(lrt, n=nrow(tcga.ex.norm))$table
+  
+source("RUV4.R")
+
+  chosen_i = 2
+  empirical <- rownames(tail(top.tcga.pre.ruv, n=1000))
+  set1 = RUVg4.poi(round(tcga.ex.norm)+1,x1=design[,2],x2=NULL,cIdx=empirical,k=chosen_i)
+  fmla <- as.formula(paste(c("~ Label", paste(rep("W_", times=chosen_i), 1:chosen_i, sep="")), collapse=" + "))
+  colnames(set1[[1]]) = paste(rep("W_", times=chosen_i), 1:chosen_i, sep="")
+  design <- model.matrix(fmla, data=data.frame(Label = design[,2], set1[[1]]))
+  
+  y <- DGEList(counts=round(as.matrix(tcga.ex.norm)), group=design[,2])
+  y <- calcNormFactors(y, method="upperquartile")
+  y <- estimateGLMCommonDisp(y, design)
+  y <- estimateGLMTagwiseDisp(y, design)
+  fit <- glmFit(y, design)
+  lrt <- glmLRT(fit, coef=2)
+  top.tcga <- topTags(lrt, n=nrow(tcga.ex.norm))$table
+  write.csv(top.tcga, "DE_table_tcga.csv")
+  
+  pdf("plotSmear_de_tcga.pdf", useDingbats=F)
+  deg <- rownames(top.tcga)[top.tcga$FDR < 0.05]
+  plotSmear(y, de.tags=deg, pch=19)
+  abline(h = c(-1, 1), col = "dodgerblue")
+  fat_2_ways_PCR_expression <- read_csv("fat_2_ways_PCR_expression.csv")
+	fat_2_ways_PCR_expression = data.frame(fat_2_ways_PCR_expression)
+	gene_selection = fat_2_ways_PCR_expression$Gene
+	gene_selection = gene_selection[!gene_selection%in%c("KLF5", "ACAN", "DES")]
+  text(x=top.tcga[gene_selection,]$logCPM, y=top.tcga[gene_selection,]$logFC, labels=gene_selection, cex=1, pos=1, col="white", font=2)
+    text(x=top.tcga[gene_selection,]$logCPM, y=top.tcga[gene_selection,]$logFC, labels=gene_selection, cex=1, pos=1, col="chartreuse4")
+  dev.off()
+
+  tcga.ex.norm.ruv = (t(set1[[2]]))
+  pdf("mds_plot_PRE_ruv_tcga.pdf", useDingbats=F)
+  plotMDS(
+	log(tcga.ex.norm), 
+	col=c("black", "red")[factor(design[,2])],
+	#col=c("black", "red", "green", "purple", "blue", "brown", "orange")[factor(tcga.info.clinical$lab)], 
+	labels=tcga.info.clinical$lab 
+	)
+  dev.off()
+
+  
+  pdf("mds_plot_POST_ruv_tcga.pdf", useDingbats=F)
+  plotMDS(
+	log(tcga.ex.norm.ruv), 
+	col=c("black", "red")[factor(design[,2])],
+	#col=c("black", "red", "green", "purple", "blue", "brown", "orange")[factor(tcga.info.clinical$lab)], 
+	labels=tcga.info.clinical$lab 
+	)
+  dev.off()
+
+genes_4_classification =  c("IGHA1", "RERGL", "OLFM4", "KIF25", "SOCS3", "CLDN1","MYH11", "PLA2G2A", "PCDH10", "SAA2", "COL6A6", "SELE", "GPR34", "SLC2A1")
+com_gen = intersect(genes_4_classification, rownames(top.tcga))
+rank_our = rownames(top)[rownames(top)%in%com_gen]
+rank_our = data.frame(gene=rank_our, our=1:length(rank_our))
+rank_tcga = rownames(top.tcga)[rownames(top.tcga)%in%com_gen]
+rank_tcga = data.frame(gene=rank_tcga, their=1:length(rank_tcga))
+all_rank = merge(rank_our, rank_tcga, by="gene")
+pdf("rank_comparison.pdf", useDingbats=F)
+plot(all_rank$our, all_rank$their, cex=0.1, main="match between ranks - poor")
+dev.off()
+
+tcga_4_signature = na.omit(top.tcga[gene_selection,])
+tcga_4_signature[order(tcga_4_signature$FDR),]
+write.csv(tcga_4_signature, "tcga_4_signature.csv")
+```
+
+## Classification for TCGA
+
+
+```{r}
+# http://machinelearningmastery.com/feature-selection-with-the-caret-r-package/
+# ensure the results are repeatable
+
+# load the library
+library(mlbench)
+library(caret)
+# calculate correlation matrix
+
+tcga.info.clinical.4classif = data.frame(Sample=colnames(tcga.ex.norm.ruv), Label=tcga.info.clinical$gleason_pattern_primary)
+tcga.info.clinical.4classif$Label = as.character(tcga.info.clinical.4classif$Label)
+tcga.info.clinical.4classif$Label[tcga.info.clinical.4classif$Label==3] = "Low"
+tcga.info.clinical.4classif$Label[tcga.info.clinical.4classif$Label==4] = "High"
+
+final_markers = c("OLFM4", "RERGL")
+final_markers = c("IGHA1", "RERGL", "OLFM4", "KIF25", "SOCS3", "CLDN1","MYH11", "PLA2G2A", "PCDH10", "SAA2", "COL6A6", "SELE", "GPR34", "SLC2A1")
+final_markers = final_markers[final_markers%in%rownames(tcga.ex.norm.ruv)]
+
+set.seed(1984)
+
+
+clus <- makeCluster(10)
+clusterExport(clus,"tcga.info.clinical.4classif")
+clusterExport(clus,"final_markers")
+clusterExport(clus,"tcga.ex.norm.ruv")
+clusterExport(clus,"allClassifiers")
+clusterExport(clus,"rfe")
+clusterExport(clus,"randomForest")
+clusterExport(clus,"svm")
+clusterExport(clus,"roc")
+clusterExport(clus,"fat_2_ways_PCR_expression")
+
+
+final_performances = 
+	parLapply(clus, 1:1000, function(dummy){
+	
+	which_final_test = c(
+      sample(which(tcga.info.clinical.4classif$Label=="Low"), size=29),
+      sample(which(tcga.info.clinical.4classif$Label=="High"), size=29)
+    )
+	
+lapply(2:length(final_markers), function(l){
+ 	
+	trainingSet <- log(tcga.ex.norm.ruv[,-which_final_test] + 1)
+	trainingSet.info <-  tcga.info.clinical.4classif[-which_final_test,]
+	validationSet <- log(tcga.ex.norm.ruv[,which_final_test] + 1)
+	validationSet.info <- tcga.info.clinical.4classif[which_final_test,]
+	
+	# Subsample to compare with PCR performances
+	which_sub_train = sample(1:dim(trainingSet)[2], size=round(dim(fat_2_ways_PCR_expression)[2]*0.7))
+	which_sub_test = sample(1:dim(validationSet)[2], size=round(dim(fat_2_ways_PCR_expression)[2]*0.3))
+
+	trainingSet <- trainingSet[,which_sub_train]
+	trainingSet.info <-  trainingSet.info[which_sub_train,]
+	validationSet <- validationSet[,which_sub_test]
+	validationSet.info <- validationSet.info[which_sub_test,]
+	
+	
+	my_g <- 
+	  list(
+	    train=trainingSet, 
+	    train.info=trainingSet.info, 
+	    test=validationSet, 
+	    test.info=validationSet.info
+	  ) 
+	browser()
+	ac1 = allClassifiers(my_g, final_markers[1:l], "svm", Class ~ .)
+	ac2 = allClassifiers(my_g, final_markers[1:l], "rf", Class ~ .)
+	ac3 = allClassifiers(my_g, final_markers[1:l], "glm", Class ~ .)
+	
+	list(svm = ac1, rf = ac2, glm = ac3, 
+	summary = rbind(
+		c(final_markers, l, ac1$svm$roc$auc, algorithm="svm"),
+		c(final_markers, l, ac2$rf$roc$auc, algorithm="rf"),
+		c(final_markers, l, ac3$glm$roc$auc, algorithm="glm")
+	))
+
+})
+})
+
+performancesTable = do.call("rbind", lapply(1:length(final_performances), function(i) 
+	{
+	temp = do.call("rbind", lapply(final_performances[[i]], function(fi) fi$summary))
+	data.frame(run=i, temp[,(dim(temp)[2]-2):dim(temp)[2] ] )
+	
+	}))
+colnames(performancesTable) = c("run", "number.of.features", "value", "variable")
+performancesTable$value = as.numeric(as.character(performancesTable$value))
+performancesTable$number.of.features = as.numeric(as.character(performancesTable$number.of.features))
+df1 = aggregate(performancesTable$value, by=list(number.of.features=performancesTable$number.of.features, variable=performancesTable$variable), mean)
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+}
+df2 = aggregate(performancesTable$value, by=list(number.of.features=performancesTable$number.of.features, variable=performancesTable$variable), st.err)
+
+performancesTable = data.frame(df1, se = df2$x)
+colnames(performancesTable)[3] = "value"
+
+#plot performances over feature number
+ggplot(
+  data=performancesTable, 
+  aes(
+    x=number.of.features,
+    y=value, 
+    group=interaction(variable), 
+    colour=as.factor(variable)
+  )
+) + 
+	scale_colour_brewer(palette = "Set1") +
+  theme_bw() +
+  theme( 
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_blank(),
+    #axis.text.x = element_text(angle = 90, vjust=0.3, hjust=1),
+    text = element_text(size=9)
+  ) +
+  geom_line() +
+	geom_ribbon(aes(ymin=value-se, ymax=value+se),alpha=0.1, colour=NA) +
+	scale_x_continuous( breaks=(1:7)*2) +
+  ylab("AUC") 
+
+ggsave("AUC_pp_size_feature_selection_TCGA.pdf")
+
+
+lengthArrays <- max(unlist(lapply(final_performances, function(x) length(x[[1]]$svm$svm$roc$sensitivities))))
+
+sens = do.call("cbind", lapply(final_performances, function(x) {
+  s <- unlist(x[[1]]$svm$svm$roc$sensitivities)
+  if(length(s)==lengthArrays) s 
+}))
+spec = do.call("cbind", lapply(final_performances, function(x) {
+  s <- unlist(x[[1]]$svm$svm$roc$specificities)
+  if(length(s)==lengthArrays) s 
+}))
+plot_auc_df <- 
+  data.frame(
+    sens.mean = rowMeans(sens), 
+    sens.se=rowSds(sens),
+    spec.mean = rowMeans(spec), 
+    spec.se=rowSds(spec)
+  )
+
+all_perf = (unlist(lapply(final_performances, function(x) {
+  unlist(x[[1]]$svm$svm$roc$auc)
+})))
+
+ggplot(
+  data=plot_auc_df, 
+  aes(x=spec.mean, y=sens.mean)
+) + 
+  geom_line() +
+  scale_x_reverse() +
+  theme_bw() +
+  theme( panel.grid.minor.x = element_blank() ,panel.grid.minor.y = element_blank()) +
+  guides(colour=FALSE) +
+	 annotate("text", x = 0.4, y = 0.5, label = sprintf("%s +/- SD %s (genes = OLFM4, RERGL)", round(mean(all_perf), 2), round(sd(all_perf), 2) )
+)
+
+ggsave("AUC_pp_feature_selection_TCGA_svm.pdf")
+```
